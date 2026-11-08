@@ -280,25 +280,28 @@ class LiveRun:
                         "feel": res["feel"], "spread": spread, "pings": pings,
                         "low": max(0, res["score"] - spread), "high": min(100, res["score"] + spread)}
 
-        title, traces = self._traces(steps, m, rtts, loaded)
+        title, traces, counts = self._traces(steps, m, rtts, loaded)
         return {"m": m, "view": {k: v for k, v in m.items() if k not in from_prior},
-                "estimate": estimate, "traces": traces, "trace_title": title,
+                "estimate": estimate, "traces": traces, "trace_title": title, "trace_counts": counts,
                 "activity": self._activity(steps, m, info, rtts, udp, loaded, mbps, bloat, pings)}
 
     def _traces(self, steps, m, rtts, loaded):
-        n = TRACE_POINTS
+        """-> (title, {key: last TRACE_POINTS values}, {key: total values so far}). The totals let the graph
+        scroll smoothly once a series is longer than the window."""
         if steps["down"] == "run":
-            return "Ping while downloading", {"load": loaded["down"][-n:]}
-        if steps["up"] == "run":
-            return "Ping while uploading", {"load": loaded["up"][-n:]}
-        traces = {}
-        g = m.get("servers")
-        if g and g.get("primary"):
-            names = [t["name"] for t in self.cfg["servers"]]
-            traces["servers"] = rtts.get(("srv", names.index(g["primary"])), [])[-n:]
-        if rtts.get("gw"):
-            traces["router"] = rtts["gw"][-n:]
-        return "Ping to the game servers", traces
+            full, title = {"load": loaded["down"]}, "Ping while downloading"
+        elif steps["up"] == "run":
+            full, title = {"load": loaded["up"]}, "Ping while uploading"
+        else:
+            full, title = {}, "Ping to the game servers"
+            g = m.get("servers")
+            if g and g.get("primary"):
+                names = [t["name"] for t in self.cfg["servers"]]
+                full["servers"] = rtts.get(("srv", names.index(g["primary"])), [])
+            if rtts.get("gw"):
+                full["router"] = rtts["gw"]
+        n = TRACE_POINTS
+        return title, {k: v[-n:] for k, v in full.items()}, {k: len(v) for k, v in full.items()}
 
     def _activity(self, steps, m, info, rtts, udp, loaded, mbps, bloat, pings):
         conn, w, sysm = m["connection"], m["wifi"], m["system"]

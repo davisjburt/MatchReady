@@ -86,6 +86,36 @@ def test_draws_series_markers_bars_and_labels(root):
     assert bar_fills == {THEME["green"], THEME["red"]}   # 80 and 92 are good, 55 is bad
 
 
+def test_live_trace_head_glides_instead_of_jumping(root):
+    from matchready import gui
+    tr = gui.LiveTrace(root)
+    tr.configure(width=500, height=120)
+    tr.pack()
+    root.update()
+    data, frames = [], []
+    t0 = next_ping = next_snap = time.perf_counter()
+    while time.perf_counter() - t0 < 1.6:   # pings every 0.15 s, snapshots every 0.25 s, like a real check
+        now = time.perf_counter()
+        while next_ping <= now:
+            data.append(30.0 + len(data) % 5)
+            next_ping += 0.15
+        if next_snap <= now:
+            tr.set({"servers": data[-100:]}, {"servers": len(data)})
+            next_snap += 0.25
+        root.update()
+        frames.append(tr.shown["servers"] if "servers" in tr.shown else 0.0)
+        time.sleep(0.004)
+    assert all(b >= a for a, b in zip(frames, frames[1:]))      # never moves backwards
+    steps = [b - a for a, b in zip(frames, frames[1:]) if b > a]
+    assert max(steps) < 0.6                                    # no whole-point jumps between frames
+    assert 0 < len(data) - frames[-1] < 3                      # trails the newest data by a little
+    tr.set(None)
+    root.update()
+    assert "Every ping draws here" in " ".join(tr.itemcget(i, "text") for i in tr.find_all()
+                                               if tr.type(i) == "text")
+    tr.destroy()
+
+
 def test_smooth_curve_passes_through_points_without_overshooting():
     from matchready.aa import smooth
     pts = [(0, 10), (20, 50), (40, 50), (60, 5), (80, 30)]

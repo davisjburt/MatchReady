@@ -8,6 +8,7 @@ redrew hundreds of rounded rectangles and the CTk scrollbar forced an extra full
 took 250-600 ms. Plain frames and labels relayout in a few milliseconds.
 """
 import ctypes
+import math
 import os
 import queue
 import sys
@@ -437,66 +438,176 @@ class Tooltip:
 
 
 # ---------- canvas drawing (the Check view is one canvas: see CheckPage) ----------
-def draw_trace(c, x0, y0, w, h, traces, tags=("drawn",)):
+class LiveTrace(tk.Canvas):
     """Ping during the check: one line per target with a soft fill, red ticks for lost packets, and the
-    latest value marked on the game-server line."""
-    left, top_pad, bottom, right = x0 + px(30), y0 + px(20), y0 + h - px(4), x0 + w - px(4)
-    if not traces:
+    latest value marked on the game-server line.
+
+    Pings arrive every 0.1-0.15 s but snapshots only ~4x/s, so drawing each snapshot as-is makes the line jump
+    1-2 points at a time. Instead the line's head glides: each series has a revealed position (a fractional
+    point count) that moves at the measured ping rate, trailing the data by about one snapshot so it never
+    has to stop and wait. The y scale eases between sizes too. Only this small canvas redraws per frame."""
+
+    FRAME_MS = 16
+    LAG_S = 0.3          # how far the head trails the newest data while data is still arriving
+    SCALE_TAU = 0.25     # y-scale easing time constant (s)
+
+    def __init__(self, master):
+        super().__init__(master, bg=CARD, bd=0, highlightthickness=0)
+        self.traces, self.counts = {}, {}
+        self.shown = {}                    # key -> revealed point count (float, in global indices)
+        self.rate = {}                     # key -> (t0, count0) for measuring the ping rate
+        self.last_data = 0.0
+        self.top = None                    # y-scale top as drawn (eased)
+        self.job, self.t_prev = None, None
+        self.bind("<Configure>", lambda e: self._render())
+
+    def set(self, traces, counts=None):
+        traces = traces or {}
+        counts = counts or {k: len(v) for k, v in traces.items()}
+        now = time.perf_counter()
+        if set(traces) != set(self.traces):  # new phase (e.g. idle -> downloading): start from the left
+            self.shown, self.rate, self.top = {}, {}, None
+        for k, total in counts.items():
+            if total < self.counts.get(k, 0):  # a new check started
+                self.shown.pop(k, None)
+                self.rate.pop(k, None)
+            self.shown.setdefault(k, 0.0)
+            self.rate.setdefault(k, (now, total))
+        if counts != self.counts:
+            self.last_data = now
+        self.traces, self.counts = traces, counts
+        if not traces:
+            self.shown, self.rate, self.top = {}, {}, None
+            self._render()
+            return
+        self._kick()
+
+    # ---- animation
+    def _kick(self):
+        if self.job is None:
+            self.t_prev = time.perf_counter()
+            self.job = self.after(self.FRAME_MS, self._tick)
+
+    def _ping_rate(self, k, now):
+        t0, c0 = self.rate[k]
+        if now - t0 > 0.6 and self.counts[k] > c0:
+            return (self.counts[k] - c0) / (now - t0)
+        return 1 / 0.15
+
+    def _tick(self):
+        self.job = None
+        now = time.perf_counter()
+        dt = min(0.1, now - self.t_prev)
+        self.t_prev = now
+        busy = False
+        since = now - self.last_data
+        live = since < 0.5  # data still arriving: trail it; otherwise catch up fully
+        for k, total in self.counts.items():
+            s, rate = self.shown.get(k, 0.0), self._ping_rate(k, now)
+            # Where the data is now, predicted from the ping rate (snapshots land in steps; this glides),
+            # minus the lag. Never past what has actually arrived.
+            target = min(total, max(0.0, total + rate * (since - self.LAG_S))) if live else total
+            v = rate + 1.5 * (target - s)  # steady speed, gently nudged to hold the lag
+            s = min(float(total), s + max(0.0, v) * dt)
+            if not live and total - s < 0.02:
+                s = float(total)
+            self.shown[k] = s
+            busy |= s < total
+        want = self._want_top()
+        if self.top is None:
+            self.top = want
+        else:
+            self.top += (want - self.top) * (1 - math.exp(-dt / self.SCALE_TAU))
+            if abs(want - self.top) < 0.3:
+                self.top = want
+            busy |= self.top != want
+        self._render()
+        if busy or live:
+            self.job = self.after(self.FRAME_MS, self._tick)
+
+    def _visible(self, k):
+        """[(global index, value)] for the revealed part of series k, plus the fractional head point."""
+        series, total = self.traces.get(k, []), self.counts.get(k, 0)
+        base, s = total - len(series), self.shown.get(k, 0.0)
+        out = [(base + i, v) for i, v in enumerate(series) if base + i <= s - 1 + 1e-9]
+        head = s - 1
+        i0 = int(math.floor(head)) - base
+        if 0 <= i0 < len(series) - 1 and head > base + i0 + 1e-9:
+            a, b = series[i0], series[i0 + 1]
+            if a is not None and b is not None:
+                f = head - (base + i0)
+                out.append((head, a + (b - a) * f))
+        return out
+
+    def _want_top(self):
+        vals = [v for k in self.traces for _, v in self._visible(k) if v is not None]
+        want = max(40.0, max(vals) * 1.15) if vals else 40.0
+        return float(next((s for s in GRAPH_SCALES if s >= want), want))
+
+    # ---- drawing
+    def _render(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 60 or h < 40:
+            return
+        left, top_pad, bottom, right = px(30), px(20), h - px(4), w - px(4)
+        span = bottom - top_pad
+        if not self.traces:
+            for frac in (0.0, 0.5, 1.0):
+                y = bottom - frac * span
+                self.create_line(left, y, right, y, fill=LINE, dash=() if frac == 0 else (2, 4))
+            self.create_text((left + right) / 2, (top_pad + bottom) / 2, fill=LABEL, font=font(11),
+                             text="Every ping draws here while a check runs.")
+            return
+        top = self.top or self._want_top()
+        aa = AALayer(0, 0, w, h, CARD)
+        n = runner.TRACE_POINTS
+        dx = (right - left) / (n - 1)
+        off = max([0.0] + [s - n for s in self.shown.values()])  # scroll once a series outgrows the window
+
+        def xy(g, v):
+            return left + (g - off) * dx, bottom - min(v, top) / top * span
+
         for frac in (0.0, 0.5, 1.0):
-            y = bottom - frac * (bottom - top_pad)
-            c.create_line(left, y, right, y, fill=LINE, dash=() if frac == 0 else (2, 4), tags=tags)
-        c.create_text((left + right) / 2, (top_pad + bottom) / 2, fill=LABEL, font=font(11), tags=tags,
-                      text="Every ping draws here while a check runs.")
-        return
-    aa = AALayer(x0, y0, w, h, CARD)  # lines, fills and dots, anti-aliased; sits under the grid and text
-    mark = c.create_line(0, 0, 0, 0, tags=tags)
-    vals = [v for t in traces.values() for v in t if v is not None]
-    want = max(40.0, max(vals) * 1.15) if vals else 40.0
-    top = next((s for s in GRAPH_SCALES if s >= want), want)
-    span = bottom - top_pad
-    for frac in (0.0, 0.5, 1.0):
-        y = bottom - frac * span
-        c.create_line(left, y, right, y, fill=LINE, dash=() if frac == 0 else (2, 4), tags=tags)
-        c.create_text(left - px(6), y, text=f"{top * frac:.0f}", anchor="e", fill=LABEL, font=font(9), tags=tags)
-    dx = (right - left) / (runner.TRACE_POINTS - 1)
-
-    def xy(i, v):
-        return left + i * dx, bottom - min(v, top) / top * span
-
-    legend_x, lost, tag = left, False, None
-    for key, series in traces.items():
-        color, label = TRACE_STYLE[key]
-        segs, seg = [], []
-        for i, v in enumerate(series):
-            if v is None:  # lost packet: red tick on the baseline, and the line breaks
-                lost = True
-                x = left + i * dx
-                aa.line([(x, bottom - px(8)), (x, bottom)], RED, max(1, px(2)))
-                segs.append(seg)
-                seg = []
-            else:
-                seg.append(xy(i, v))
-        segs.append(seg)
-        for sg in segs:
-            if len(sg) > 1:
-                curve = smooth(sg)
-                if key != "router":
-                    aa.polygon([(sg[0][0], bottom)] + curve + [(sg[-1][0], bottom)], blend(color, CARD, 0.10))
-                aa.line(curve, color, max(1, px(1.5)))
-        last_i = next((i for i in range(len(series) - 1, -1, -1) if series[i] is not None), None)
-        last = series[last_i] if last_i is not None else None
-        if key != "router" and last is not None:
-            tag = xy(last_i, last)
-        item = c.create_text(legend_x, y0 + px(6), anchor="w", fill=color, font=font(10, "bold"), tags=tags,
-                             text=f"● {label}" + (f" {last:.0f} ms" if last is not None else ""))
-        legend_x = c.bbox(item)[2] + px(14)
-    if lost:
-        c.create_text(legend_x, y0 + px(6), anchor="w", fill=RED, font=font(10, "bold"), text="| Lost packet",
-                      tags=tags)
-    if tag:
-        aa.oval(*tag, px(3.5), CARD, TEXT, max(1, px(1.5)))
-    c.tag_lower(aa.paste(c, tags), mark)
-    c.delete(mark)
+            y = round(bottom - frac * span) + 0.5  # on a pixel centre, so the 1 px grid stays crisp
+            aa.line([(left, y), (right, y)], LINE, 1, dash=None if frac == 0 else (2, 4))
+        legend_x, lost, tag = left, False, None
+        legend = []
+        for key in self.traces:
+            color, label = TRACE_STYLE[key]
+            pts = self._visible(key)
+            segs, seg = [], []
+            for g, v in pts:
+                if v is None:  # lost packet: red tick on the baseline, and the line breaks
+                    lost = True
+                    x = xy(g, 0)[0]
+                    aa.line([(x, bottom - px(8)), (x, bottom)], RED, max(1, px(2)))
+                    segs.append(seg)
+                    seg = []
+                else:
+                    seg.append(xy(g, v))
+            segs.append(seg)
+            for sg in segs:
+                if len(sg) > 1:
+                    curve = smooth(sg)
+                    if key != "router":
+                        aa.polygon([(sg[0][0], bottom)] + curve + [(sg[-1][0], bottom)], blend(color, CARD, 0.10))
+                    aa.line(curve, color, max(1, px(1.5)))
+            last = next(((g, v) for g, v in reversed(pts) if v is not None), None)
+            if key != "router" and last is not None:
+                tag = xy(*last)
+            legend.append((color, f"● {label}" + (f" {last[1]:.0f} ms" if last is not None else "")))
+        if tag:
+            aa.oval(*tag, px(3.5), CARD, TEXT, max(1, px(1.5)))
+        aa.paste(self)  # first, so the text sits on top
+        for frac in (0.0, 0.5, 1.0):
+            self.create_text(left - px(6), bottom - frac * span, text=f"{top * frac:.0f}", anchor="e", fill=LABEL,
+                             font=font(9))
+        for color, text in legend:
+            item = self.create_text(legend_x, px(6), anchor="w", fill=color, font=font(10, "bold"), text=text)
+            legend_x = self.bbox(item)[2] + px(14)
+        if lost:
+            self.create_text(legend_x, px(6), anchor="w", fill=RED, font=font(10, "bold"), text="| Lost packet")
 
 
 def _hex_rgb(h):
@@ -788,7 +899,8 @@ class CheckPage(CanvasPage):
         self.stats = {k: VStat(self, label, unit) for k, label, unit in (
             ("ping", "Ping", "ms"), ("jitter", "Jitter", "ms"), ("loss", "Packet loss", "%"),
             ("bloat", "Bufferbloat", "ms"))}
-        self.trace_title, self.traces = self.vt("", MUTED), None
+        self.trace_title = self.vt("", MUTED)
+        self.trace_view = LiveTrace(self.c)  # animates itself; the page only positions it
         self.side = (None, None, None, None, False, False)
         self.advice = ([], "Advice shows up here after your first check.", AMBER)
         self.cells, self.groups = {}, ([], [])
@@ -803,10 +915,9 @@ class CheckPage(CanvasPage):
         self.c.tag_bind(v.tag, "<Leave>", lambda e: self._tip_hide())
         return v
 
-    def set_trace(self, title, traces):
-        self.trace_title.configure(text=title)
-        self.traces = traces
-        self.request()
+    def set_trace(self, title, traces, counts=None):
+        self.trace_title.configure(text=title)  # re-lays out the page only when the title changes
+        self.trace_view.set(traces, counts)
 
     def set_side(self, *vals):
         if vals != self.side:
@@ -896,7 +1007,7 @@ class CheckPage(CanvasPage):
         if self.trace_title.text:
             self._t(x + w - P, hy, self.trace_title.text, 11, MUTED, anchor="ne")
         ty = hb + px(8)
-        draw_trace(c, x + P, ty, w - 2 * P, px(118), self.traces)
+        self.put(self.trace_view, x + P, ty, width=w - 2 * P, height=px(118))
         h = ty + px(118) + P - y
         self._card(x, y, w, h, "Connection score", self.meta)
         return h
@@ -1549,8 +1660,8 @@ class App(tk.Tk):
         if self.step_line.cget("text") != text:
             self.step_line.configure(text=text)
 
-    def draw_spark(self, title, traces):
-        self.check_page.set_trace(title, traces)
+    def draw_spark(self, title, traces, counts=None):
+        self.check_page.set_trace(title, traces, counts)
 
     def trace_empty(self):
         self.check_page.set_trace("", None)
@@ -1565,7 +1676,7 @@ class App(tk.Tk):
     def apply_live(self, snap):
         """Paint a partial snapshot: activity, graph, predicted scores and whichever measurements exist yet."""
         self.draw_activity(snap["activity"])
-        self.draw_spark(snap["trace_title"], snap["traces"])
+        self.draw_spark(snap["trace_title"], snap["traces"], snap.get("trace_counts"))
         m = snap["m"]
         est = snap["estimate"]
         if est and m.get("servers"):
