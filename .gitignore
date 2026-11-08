@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Build output (the exe goes on GitHub Releases, not in the repo)
+build/
+dist/
+*.spec
+# Rewritten by every build; holds this machine's project path
+matchready/_build_info.json
+
+# Local design notes
+.impeccable/

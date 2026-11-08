@@ -1,0 +1,17 @@
+{
+  "_comment": "Edit freely. 'servers' are game datacenters in your region; the check uses the lowest-ping one, like matchmaking would, and pools packet loss across all of them. 'tcp_port' is used as a fallback when ICMP ping is blocked (null = no fallback). Set 'region' to match.",
+  "region": "US Central",
+  "servers": [
+    {"name": "Chicago (Blizzard)", "host": "24.105.62.129", "tcp_port": null},
+    {"name": "Dallas (Vultr)", "host": "tx-us-ping.vultr.com", "tcp_port": 443},
+    {"name": "Dallas (Linode)", "host": "speedtest.dallas.linode.com", "tcp_port": 443},
+    {"name": "Chicago (Vultr)", "host": "il-us-ping.vultr.com", "tcp_port": 443},
+    {"name": "Chicago (Linode)", "host": "speedtest.chicago.linode.com", "tcp_port": 80},
+    {"name": "Iowa (Google Cloud)", "host": "storage.us-central1.rep.googleapis.com", "tcp_port": 443}
+  ],
+  "reference_host": "1.1.1.1",
+  "stun_servers": [
+    ["stun.l.google.com", 19302],
+    ["stun.cloudflare.com", 3478]
+  ]
+}

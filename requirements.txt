@@ -1,0 +1,6 @@
+customtkinter>=5.2
+icmplib>=3.0
+psutil>=5.9
+pillow>=10
+pytest>=8
+pyinstaller>=6
