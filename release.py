@@ -88,6 +88,12 @@ def main(argv):
     sha_file.write_text(f"{hashlib.sha256(exe.read_bytes()).hexdigest()}  {ASSET}\n", encoding="ascii")
     files, tag = [exe, sha_file], f"v{version}"
 
+    if (ROOT / ".git").is_dir():  # commit and push the version bump, so the release tag points at it
+        subprocess.run(["git", "add", str(INIT)], cwd=ROOT)
+        subprocess.run(["git", "commit", "-q", "-m", f"Release {tag}"], cwd=ROOT)
+        if subprocess.run(["git", "push", "-q"], cwd=ROOT).returncode != 0:
+            print("Couldn't push to GitHub; the release will point at the last pushed commit.")
+
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         url = upload_with_token(repo, tag, notes, files, token)
